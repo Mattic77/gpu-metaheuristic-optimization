@@ -1,215 +1,167 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <math_functions.h>
-
+#include <curand_kernel.h>
 #include "kernel.h"
 
-
-__device__ float tempParticle1[NUM_OF_DIMENSIONS];
-__device__ float tempParticle2[NUM_OF_DIMENSIONS];
-
-/* Objective function
-0: Levy 3-dimensional
-1: Shifted Rastigrin's Function
-2: Shifted Rosenbrock's Function
-3: Shifted Griewank's Function
-4: Shifted Sphere's Function
-*/
-/**
- * Runs on the GPU, called from the GPU.
-*/
+// Fonction de fitness sur le GPU
 __device__ float fitness_function(float x[]) {
     float res = 0;
     float somme = 0;
-    float produit = 0;
+    float produit = 1;
 
-    switch (SELECTED_OBJ_FUNC)  {
-        case 0: 
-            float y1 = 1 + (x[0] - 1)/4;
-            float yn = 1 + (x[NUM_OF_DIMENSIONS-1] - 1)/4;
-
-            res += pow(sin(phi*y1), 2);
-
-            for (int i = 0; i < NUM_OF_DIMENSIONS-1; i++) {
-                float y = 1 + (x[i] - 1)/4;
-                float yp = 1 + (x[i+1] - 1)/4;
-                res += pow(y - 1, 2)*(1 + 10*pow(sin(phi*yp), 2)) + pow(yn - 1, 2);
-            }
-            break;
-        case 1: 
+    switch (SELECTED_OBJ_FUNC) {
+        case 1: // Shifted Rastrigin's Function[cite: 1]
             for (int i = 0; i < NUM_OF_DIMENSIONS; i++) {
-                float zi = x[i] - 0;
-                res += pow(zi, 2) - 10*cos(2*phi*zi) + 10;
+                float zi = x[i];
+                res += pow(zi, 2) - 10 * cos(2 * phi * zi) + 10;
             }
             res -= 330;
             break;
-        
-        case 2:
-            for (int i = 0; i < NUM_OF_DIMENSIONS-1; i++) {
-                float zi = x[i] - 0 + 1;
-                float zip1 = x[i+1] - 0 + 1;
-                res += 100 * ( pow(pow(zi, 2) - zip1, 2)) + pow(zi - 1, 2);
-            }
-            res += 390;
-            break;
-        case 3:
-            for (int i = 0; i < NUM_OF_DIMENSIONS; i++) {
-                float zi = x[i] - 0;
-                somme += pow(zi, 2)/4000;
-                produit *= cos(zi/pow(i+1, 0.5));
-            }
-            res = somme - produit + 1 - 180; 
-            break;
-        case 4:
+        case 4: // Shifted Sphere's Function[cite: 1]
             for(int i = 0; i < NUM_OF_DIMENSIONS; i++) {
-                float zi = x[i] - 0;
-                res += pow(zi, 2);
+                res += pow(x[i], 2);
             }
             res -= 450;
             break;
+        default:
+            break;
     }
-
     return res;
 }
 
-/**
- * 
- * Runs on the GPU, called from the CPU or the GPU
-*/
-__global__ void kernelUpdateParticle(float *positions, float *velocities, 
-                                     float *pBests, float *gBest, float r1, 
-                                     float r2)
-{
+// 1. Noyau d'initialisation et d'évaluation combinés (kernel_IE)[cite: 2]
+__global__ void kernel_IE(float *positions, float *fitnessVals) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= NUM_OF_PARTICLES) return;
 
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // avoid an out of bound for the array 
-    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS)
-        return;
-
-    //float rp = getRandomClamped();
-    //float rg = getRandomClamped();
-    
-    float rp = r1; // random weight for personnal =>  computed from @getRandomClamped
-    float rg = r2; // random weight for global =>  computed from @getRandomClamped
-
-
-    // Mise à jour de velocities et positions
-    velocities[i] = OMEGA * velocities[i] + 
-                    c1 * rp * (pBests[i] - positions[i]) + 
-                    c2 * rg * (gBest[i % NUM_OF_DIMENSIONS] - positions[i]);
-
-    // Update posisi particle
-    //Mise à jour de la position de la particule courante
-    //incrémentant la position de la particule courante avec la vitesse de la particule courante
-    positions[i] += velocities[i];
+    float ind[NUM_OF_DIMENSIONS];
+    for (int j = 0; j < NUM_OF_DIMENSIONS; j++) {
+        ind[j] = positions[idx * NUM_OF_DIMENSIONS + j];
+    }
+    fitnessVals[idx] = fitness_function(ind);
 }
 
-/**
- * Runs on the GPU, called from the CPU or the GPU
-*/
-__global__ void kernelUpdatePBest(float *positions, float *pBests, float* gBest)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if(i >= NUM_OF_PARTICLES * NUM_OF_DIMENSIONS || i % NUM_OF_DIMENSIONS != 0)
-        return;
+// 2. Noyau de préparation des indices de mutation r1, r2, r3 (kernel_P)[cite: 2]
+__global__ void kernel_P(int *r1, int *r2, int *r3, unsigned long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= NUM_OF_PARTICLES) return;
 
-    for (int j = 0; j < NUM_OF_DIMENSIONS; j++)
-    {
-        tempParticle1[j] = positions[i + j];
-        tempParticle2[j] = pBests[i + j];
-    }
+    curandState state;
+    curand_init(seed, idx, 0, &state);
 
-    if (fitness_function(tempParticle1) < fitness_function(tempParticle2))
-    {
-        for (int k = 0; k < NUM_OF_DIMENSIONS; k++)
-            pBests[i + k] = positions[i + k];
-    }
+    int id1, id2, id3;
+    do { id1 = curand(&state) % NUM_OF_PARTICLES; } while (id1 == idx);
+    do { id2 = curand(&state) % NUM_OF_PARTICLES; } while (id2 == idx || id2 == id1);
+    do { id3 = curand(&state) % NUM_OF_PARTICLES; } while (id3 == idx || id3 == id1 || id3 == id2);
+
+    r1[idx] = id1;
+    r2[idx] = id2;
+    r3[idx] = id3;
 }
 
+// 3. Noyau Composite Principal : Mutation + Crossover + Evaluation + Replacement (kernel_MCER)[cite: 2]
+__global__ void kernel_MCER(float *positions, float *fitnessVals, int *r1, int *r2, int *r3, unsigned long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= NUM_OF_PARTICLES) return;
 
-extern "C" void cuda_pso(float *positions, float *velocities, float *pBests, float *gBest)
-{
+    curandState state;
+    curand_init(seed + idx, idx, 0, &state);
 
-    int size = NUM_OF_PARTICLES * NUM_OF_DIMENSIONS;
-    
-    // declare all the arrays on the device
-    float *devPos;
-    float *devVel;
-    float *devPBest;
-    float *devGBest;
-    
-    float temp[NUM_OF_DIMENSIONS];
-        
-    // Memory allocation
-    cudaMalloc((void**)&devPos, sizeof(float) * size);
-    cudaMalloc((void**)&devVel, sizeof(float) * size);
-    cudaMalloc((void**)&devPBest, sizeof(float) * size);
-    cudaMalloc((void**)&devGBest, sizeof(float) * NUM_OF_DIMENSIONS);
-    
-    // Thread & Block number
-    int threadsNum = 32;
-    int blocksNum = ceil(size / threadsNum);
-    
-    // Copy particle datas from host to device
-    /**
-     * Copy in GPU memory the data from the host 
-     * */
-    cudaMemcpy(devPos, positions, sizeof(float) * size, cudaMemcpyHostToDevice);
-    cudaMemcpy(devVel, velocities, sizeof(float) * size, 
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(devPBest, pBests, sizeof(float) * size, cudaMemcpyHostToDevice);
-    cudaMemcpy(devGBest, gBest, sizeof(float) * NUM_OF_DIMENSIONS, 
-               cudaMemcpyHostToDevice);
-    
-    // PSO main function
-    // MAX_ITER = 30000;
+    int i1 = r1[idx];
+    int i2 = r2[idx];
+    int i3 = r3[idx];
 
-    for (int iter = 0; iter < MAX_ITER; iter++)
-    {     
+    int randDim = curand(&state) % NUM_OF_DIMENSIONS;
+    float trial[NUM_OF_DIMENSIONS];
 
-        kernelUpdateParticle<<<blocksNum, threadsNum>>>(devPos, devVel, 
-                                                        devPBest, devGBest, 
-                                                        getRandomClamped(), 
-                                                        getRandomClamped());  
+    // Mutation (DE/rand/1) & Croisement binomial (bin)[cite: 2]
+    for (int j = 0; j < NUM_OF_DIMENSIONS; j++) {
+        float valR1 = positions[i1 * NUM_OF_DIMENSIONS + j];
+        float valR2 = positions[i2 * NUM_OF_DIMENSIONS + j];
+        float valR3 = positions[i3 * NUM_OF_DIMENSIONS + j];
+        float targetVal = positions[idx * NUM_OF_DIMENSIONS + j];
 
-        kernelUpdatePBest<<<blocksNum, threadsNum>>>(devPos, devPBest, 
-                                                     devGBest);
-        
-        cudaMemcpy(pBests, devPBest, 
-                   sizeof(float) * NUM_OF_PARTICLES * NUM_OF_DIMENSIONS, 
-                   cudaMemcpyDeviceToHost);
-        
-        
-        for(int i = 0; i < size; i += NUM_OF_DIMENSIONS)
-        {
-            for(int k = 0; k < NUM_OF_DIMENSIONS; k++) //ssB1 
-                temp[k] = pBests[i + k];
-        
-            if (host_fitness_function(temp) < host_fitness_function(gBest))
-            {
-                for (int k = 0; k < NUM_OF_DIMENSIONS; k++)
-                    gBest[k] = temp[k];
-            }   
+        float cr_rand = curand_uniform(&state);
+
+        if (cr_rand <= CR || j == randDim) {
+            // Formule de mutation différentielle : v = r1 + F * (r2 - r3)[cite: 2]
+            trial[j] = valR1 + F * (valR2 - valR3);
+        } else {
+            trial[j] = targetVal;
         }
-        
-        cudaMemcpy(devGBest, gBest, sizeof(float) * NUM_OF_DIMENSIONS, 
-                   cudaMemcpyHostToDevice);
     }
-    
-    cudaMemcpy(positions, devPos, sizeof(float) * size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(velocities, devVel, sizeof(float) * size, 
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(pBests, devPBest, sizeof(float) * size, cudaMemcpyDeviceToHost);
-    cudaMemcpy(gBest, devGBest, sizeof(float) * NUM_OF_DIMENSIONS, 
-               cudaMemcpyDeviceToHost); 
-    
-    
-    // cleanup
-    cudaFree(devPos);
-    cudaFree(devVel);
-    cudaFree(devPBest);
-    cudaFree(devGBest);
+
+    // Évaluation du vecteur d'essai (Trial Vector)[cite: 2]
+    float trialFitness = fitness_function(trial);
+
+    // Sélection / Remplacement[cite: 2]
+    if (trialFitness < fitnessVals[idx]) {
+        fitnessVals[idx] = trialFitness;
+        for (int j = 0; j < NUM_OF_DIMENSIONS; j++) {
+            positions[idx * NUM_OF_DIMENSIONS + j] = trial[j];
+        }
+    }
 }
 
+// Fonction hôte de pilotage CUDA pour le DE
+extern "C" void cuda_de_i(float *positions, float *fitnessVals, float *bestSolution) {
+    int sizePop = NUM_OF_PARTICLES * NUM_OF_DIMENSIONS;
+
+    float *devPos, *devFitness;
+    int *devR1, *devR2, *devR3;
+
+    cudaMalloc((void**)&devPos, sizeof(float) * sizePop);
+    cudaMalloc((void**)&devFitness, sizeof(float) * NUM_OF_PARTICLES);
+    cudaMalloc((void**)&devR1, sizeof(int) * NUM_OF_PARTICLES);
+    cudaMalloc((void**)&devR2, sizeof(int) * NUM_OF_PARTICLES);
+    cudaMalloc((void**)&devR3, sizeof(int) * NUM_OF_PARTICLES);
+
+    cudaMemcpy(devPos, positions, sizeof(float) * sizePop, cudaMemcpyHostToDevice);
+
+    // ... (début de la fonction cuda_de_i inchangé)
+
+    int threadsNum = 64;
+    int blocksNum = (NUM_OF_PARTICLES + threadsNum - 1) / threadsNum;
+
+    // 1. Initialisation et Évaluation initiale
+    kernel_IE<<<blocksNum, threadsNum>>>(devPos, devFitness);
+    cudaDeviceSynchronize();
+
+    int total_gens = MAX_ITER / NUM_OF_PARTICLES;
+    
+    printf("--- Debut de l'evolution differentielle (cudaDE_i) ---\n");
+
+    // Boucle principale d'évolution (Générations)
+    for (int iter = 0; iter < total_gens; iter++) {
+        // 2. Préparation des indices aléatoires de mutation
+        kernel_P<<<blocksNum, threadsNum>>>(devR1, devR2, devR3, time(NULL) + iter);
+        
+        // 3. Exécution du noyau composite MCER
+        kernel_MCER<<<blocksNum, threadsNum>>>(devPos, devFitness, devR1, devR2, devR3, time(NULL) + iter);
+        
+        // OPTIONNEL : Afficher l'état toutes les 100 générations (pour suivre le processus)
+        if (iter % 100 == 0 || iter == total_gens - 1) {
+            cudaDeviceSynchronize();
+            
+            // Copier temporairement les fitness sur le CPU pour trouver le meilleur actuel
+            cudaMemcpy(fitnessVals, devFitness, sizeof(float) * NUM_OF_PARTICLES, cudaMemcpyDeviceToHost);
+            float current_best = fitnessVals[0];
+            for (int i = 1; i < NUM_OF_PARTICLES; i++) {
+                if (fitnessVals[i] < current_best) {
+                    current_best = fitnessVals[i];
+                }
+            }
+            printf("Generation %d / %d -> Meilleur score actuel : %f\n", iter, total_gens, current_best);
+        }
+    }
+    cudaDeviceSynchronize();
+    printf("--- Fin de l'optimisation ---\n");
+
+    // Nettoyage de la mémoire GPU
+    cudaFree(devPos);
+    cudaFree(devFitness);
+    cudaFree(devR1);
+    cudaFree(devR2);
+    cudaFree(devR3);
+}
