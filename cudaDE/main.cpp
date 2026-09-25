@@ -28,9 +28,19 @@ int main(int argc, char** argv) {
     
     clock_t end = clock();
     
-    printf("GPU (cudaDE_i) \t ");
-    printf("%10.3lf \t", (double)(end - begin) / CLOCKS_PER_SEC);
-    printf(" %f\n", host_fitness_function(bestSolution));
+    // Affichage détaillé des résultats finaux
+    printf("\n========================================\n");
+    printf("          RESULTATS FINAUX DE `cudaDE_i`   \n");
+    printf("========================================\n");
+    printf("Temps d'execution : %.3lf secondes\n", (double)(end - begin) / CLOCKS_PER_SEC);
+    printf("best solution %f \n",bestSolution);
+    printf("Valeur minimale   : %f\n", host_fitness_function(bestSolution));
+    
+    printf("Meilleure solution (Coordonnees X) :\n");
+    for(int j = 0; j < NUM_OF_DIMENSIONS; j++) {
+        printf("  x[%d] = %f\n", j, bestSolution[j]);
+    }
+    printf("========================================\n");
 
     return 0;
 }
