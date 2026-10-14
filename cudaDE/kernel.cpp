@@ -11,7 +11,7 @@
 float host_fitness_function(float x[]) {
     float res = 0;
     float somme = 0;
-    float produit = 0;
+    float produit = 1;
 
     switch (SELECTED_OBJ_FUNC)  {
         case 0: {
