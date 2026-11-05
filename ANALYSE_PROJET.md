@@ -11,160 +11,158 @@ Ce document présente une analyse exhaustive et détaillée du projet de calcul 
 
 ---
 
-## 2. Fondements Thématiques et Architecturaux de CUDA
-*(Synthèse basée sur le support de cours `courscuda.pdf`)*
+## 2. Rappels Ciblés d'Architecture GPU & Contraintes d'Exécution
 
-### 2.1 Comparaison des architectures : CPU (Multi-core) vs GPU (Many-core)
+Pour appréhender les gains et les limites d'une métaheuristique sur GPU, trois caractéristiques clés de l'architecture NVIDIA CUDA doivent être retenues :
 
-| Caractéristique | CPU (ex. Intel Core i7 / Xeon) | GPU (ex. NVIDIA GTX / Tesla / RTX) |
-| :--- | :--- | :--- |
-| **Modèle d'exécution** | **MIMD** (Multiple Instructions, Multiple Data) | **SIMD / SIMT** (Single Instruction, Multiple Threads) |
-| **Philosophie des Cœurs** | Quelques cœurs hyper-optimisés (clock élevée, prédiction de branchement, exécution superscalaire) | Des milliers de petits cœurs de calcul (ALU / SP - Streaming Processors) |
-| **Gestion de la Mémoire** | Latence minimale grâce à de très grands caches (L1, L2, L3, L4) | Débit maximal (High Bandwidth) au détriment de la latence individuelle |
-| **Cas d'usage optimal** | Traitements séquentiels complexes et branchements conditionnels lourds | Traitements massivement parallèles sur de grands tableaux de données |
+1. **Modèle SIMT (Single Instruction, Multiple Threads) et Hiérarchie de Calcul** :
+   * Les threads sont regroupés physiquement en **Warps de 32 threads** exécutés de concert sur les *Streaming Multiprocessors* (SM).
+   * L'indexation globale 1D associe chaque thread à une donnée :
+     $$\text{gtid} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$
+   * Tout branchement divergent (`if/else`) au sein d'un même warp sérialise l'exécution (**Divergence de Warp**) et dégrade les performances.
 
-Dans le domaine de l'optimisation métaheuristique (PSO, DE), où des centaines ou milliers d'individus (particules ou vecteurs) subissent des opérations mathématiques strictement identiques à chaque génération, le modèle GPU offre un facteur d'accélération d'un à plusieurs ordres de grandeur par rapport au CPU.
+2. **Hiérarchie Mémoire & Coalescence** :
+   * **Mémoire Globale (DRAM)** : Espace principal mais à forte latence (400 à 800 cycles). Les accès doivent être **coalescents** (les threads consécutifs accèdent à des adresses consécutives en mémoire).
+   * **Mémoire Partagée (`__shared__`)** : Mémoire ultra-rapide sur la puce (1 à 2 cycles), accessible par tous les threads d'un même bloc pour les réductions et le partage d'individus.
 
----
-
-### 2.2 Modèle Logique d'Exécution CUDA
-CUDA organise l'exécution sous forme d'une hiérarchie à 3 niveaux :
-1. **Thread** : L'unité élémentaire d'exécution qui exécute une instance du *kernel*. Chaque thread possède un identifiant unique accessible via la variable intégrée `threadIdx` (en 1D, 2D ou 3D).
-2. **Bloc de Threads (CTA - Cooperative Thread Array)** : Un groupe de threads (jusqu'à 512, 1024 ou 2048 selon la *Compute Capability* de la carte) s'exécutant sur le même **SM** (*Streaming Multiprocessor*). Les threads d'un même bloc peuvent se synchroniser (`__syncthreads()`) et partager des données via la mémoire partagée (`__shared__`).
-3. **Grille (Grid)** : L'ensemble des blocs déployés pour exécuter un kernel. Représentée par `gridDim` et indexée par `blockIdx`.
-
-#### Formule d'Indexation Globale 1D :
-Pour associer de manière unique un thread à un élément de données dans la mémoire globale :
-$$\text{gtid} = \text{blockIdx.x} \times \text{blockDim.x} + \text{threadIdx.x}$$
+3. **Coût Critique des Transferts Bus PCI-e** :
+   * Les échanges `cudaMemcpy(Host <-> Device)` sont particulièrement lents comparés à la bande passante interne du GPU. Une parallélisation efficace impose de **conserver l'intégralité de la boucle itérative sur le GPU** pour éviter les transferts répétés.
 
 ---
 
-### 2.3 Modèle Physique et Exécution Matérielle
-* **Streaming Multiprocessor (SM)** : Le GPU est composé de plusieurs SMs. Chaque SM contient ses propres cœurs d'exécution, registres, cache L1 et mémoire partagée.
-* **Warps & Half-Warps** : Sur le plan matériel, les threads d'un bloc sont regroupés par paquets de **32 threads** appelés **Warps**.
-  * Les 32 threads d'un warp exécutent la même instruction simultanément.
-  * Si les threads d'un warp empruntent des branches conditionnelles différentes (`if/else`), l'exécution est sérialisée (**Divergence de Warp**), dégradant les performances.
+## 3. Principe de l'Algorithme PSO et Architecture du Code `cudapso`
+
+### 3.1 Principe Fondamental du Particle Swarm Optimization (PSO)
+
+Proposé initialement par Kennedy et Eberhart (1995), le PSO s'inspire du comportement social et collectif des nuées d'oiseaux ou des bancs de poissons à la recherche d'une source de nourriture.
+
+#### 1. Modélisation de l'Essaim (Swarm)
+Un essaim est constitué de $N$ individus appelés **particules** évoluant dans un espace de recherche continu à $D$ dimensions :
+* **Position courante** de la particule $i$ au temps $t$ :
+  $$X_i^t = (x_{i,1}^t, x_{i,2}^t, \dots, x_{i,D}^t) \in \mathbb{R}^D$$
+* **Vitesse de déplacement** de la particule $i$ :
+  $$V_i^t = (v_{i,1}^t, v_{i,2}^t, \dots, v_{i,D}^t) \in \mathbb{R}^D$$
+* **Meilleure position personnelle historique ($pBest$)** trouvée par la particule $i$ :
+  $$pBest_i = (p_{i,1}, p_{i,2}, \dots, p_{i,D}), \quad \text{tel que } f(pBest_i) = \min_{\tau \le t} f(X_i^\tau)$$
+* **Meilleure position globale de l'essaim ($gBest$)** partagée par toutes les particules :
+  $$gBest = \arg\min_{i \in \{1 \dots N\}} f(pBest_i)$$
+
+#### 2. Équations Mathématiques du Mouvement
+À chaque génération $t+1$, la trajectoire de chaque particule est ajustée en fonction de son élan propre, de sa mémoire individuelle et de l'influence collective :
+
+$$\begin{cases}
+v_{i,d}^{t+1} = \underbrace{\omega \cdot v_{i,d}^t}_{\text{Inertie}} + \underbrace{c_1 \cdot r_1 \cdot (pBest_{i,d} - x_{i,d}^t)}_{\text{Composante Cognitive (Mémoire)}} + \underbrace{c_2 \cdot r_2 \cdot (gBest_d - x_{i,d}^t)}_{\text{Composante Sociale (Collectif)}} \\
+x_{i,d}^{t+1} = x_{i,d}^t + v_{i,d}^{t+1}
+\end{cases}$$
+
+Où :
+* $\omega \in ]0, 1]$ est le **facteur d'inertie** : contrôle l'équilibre exploration (valeurs élevées) / exploitation (valeurs faibles).
+* $c_1, c_2$ sont les **coefficients d'accélération** (cognitif et social) : pondèrent l'attraction vers $pBest_i$ et $gBest$.
+* $r_1, r_2 \sim \mathcal{U}(0, 1)$ sont des **variables aléatoires indépendantes** apportant la stochasticité nécessaire pour franchir les optima locaux.
 
 ---
 
-### 2.4 Hiérarchie Mémoire CUDA et Règles de Performance
+### 3.2 Fonctionnement du Code Source et Organisation Mémoire
+
+Le projet `cudapso` se compose des modules suivants :
+* [kernel.h](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/kernel.h) : Définition des paramètres de l'essaim ($N = 512$, $D = 3$), coefficients ($\omega = 0.5, c_1 = c_2 = 1.5$) et prototypes.
+* [kernel.cu](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/kernel.cu) : Implémentation des kernels CUDA (`kernelUpdateParticle`, `kernelUpdatePBest`) et orchestration Host-Device (`cuda_pso`).
+* [kernel.cpp](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/kernel.cpp) : Fonctions de fitness exécutées sur le CPU pour le calcul de $gBest$.
+* [main.cpp](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/main.cpp) : Point d'entrée, initialisation de la population, mesure du temps (`clock()`) et affichage.
+* [CudaPSO.ipynb](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/CudaPSO.ipynb) : Environnement d'exécution et de test sur GPU Google Colab.
+
+#### Linéarisation Mémoire 1D :
+Pour convenir à l'architecture GPU, la matrice bidimensionnelle des particules ($N \times D = 512 \times 3 = 1536$ scalaires) est aplatie sous forme d'un tableau continu 1D en mémoire globale (`float *devPos`, `float *devVel`, `float *devPBest`) :
+* **Indice de la particule** : $\lfloor i / D \rfloor$
+* **Indice de la dimension** : $i \pmod D$
+
+---
+
+### 3.3 Diagramme de Fonctionnement du PSO Parallèle sur GPU
+
+Le schéma ci-dessous illustre le pipeline d'exécution de l'algorithme PSO tel qu'implémenté dans le projet, mettant en évidence la répartition du travail entre le CPU (Host) et les cœurs GPU (Device) :
+
+```mermaid
+flowchart TD
+    subgraph HOST_INIT ["1. Initialisation sur CPU (Host)"]
+        H1["Initialisation aléatoire des Positions et Vitesses"] --> H2["Allocation Mémoire GPU (cudaMalloc)"]
+        H2 --> H3["Transfert Initial Host -> Device (cudaMemcpy)"]
+    end
+
+    subgraph GPU_PARALLEL ["2. Exécution Parallèle sur GPU (Device)"]
+        direction TB
+        K1["Kernel 1: kernelUpdateParticle <<<48 blocs, 32 threads>>>
+        1536 threads en parallèle (1 thread = 1 dimension/particule)
+        Calcul des nouvelles vitesses et positions"]
+        
+        K2["Kernel 2: kernelUpdatePBest <<<48 blocs, 32 threads>>>
+        Évaluation de fitness f(X_nouveau) vs f(pBest)
+        Mise à jour locale des pBests par particule"]
+        
+        K1 --> K2
+    end
+
+    subgraph REDUCTION_GBEST ["3. Réduction du gBest (Boucle Itérative)"]
+        M1["Transfert Device -> Host de tous les pBests (cudaMemcpy)"]
+        C1["Recherche séquentielle du minimum gBest sur CPU"]
+        M2["Transfert Host -> Device du nouveau gBest (cudaMemcpy)"]
+        M1 --> C1 --> M2
+    end
+
+    subgraph TERMINATION ["4. Fin et Récupération des Résultats"]
+        OUT["Transfert final des résultats vers le CPU
+        Affichage du Temps et du Minimum global trouvé"]
+    end
+
+    H3 --> K1
+    K2 --> M1
+    M2 -- "Itération < MAX_ITER" --> K1
+    M2 -- "Itération == MAX_ITER" --> OUT
+
+    style HOST_INIT fill:#f1f5f9,stroke:#64748b,stroke-width:1px
+    style GPU_PARALLEL fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+    style REDUCTION_GBEST fill:#fee2e2,stroke:#ef4444,stroke-width:1px
+    style TERMINATION fill:#dcfce7,stroke:#16a34a,stroke-width:1px
+```
+
+#### Schéma d'Exécution Physique par Thread :
 
 ```
-+-------------------------------------------------------------------+
-|                        MÉMOIRE GLOBALE (DRAM)                     |
-|            (Accès lent, 400-800 cycles, nécessite la coalescence) |
-+-------------------------------------------------------------------+
-       ^                                      ^
-       |                                      |
-+--------------+                      +--------------+
-| CACHE L2     |                      | MÉMOIRE CONST.| (Cached, Read-Only)
-+--------------+                      +--------------+
-       ^
-       |
-+-------------------------------------------------------------------+
-|                     STREAMING MULTIPROCESSOR (SM)                 |
-|  +---------------------------+    +----------------------------+  |
-|  | Mémoire Partagée (Shared) |    | Registres (Ultra-rapides)  |  |
-|  | (~1-2 cycles, inter-thread)  |    | (Propres à chaque thread)  |  |
-|  +---------------------------+    +----------------------------+  |
-|  +-------------------------------------------------------------+  |
-|  | Mémoire Locale (Local Mem - Spillover registres vers DRAM) |  |
-|  +-------------------------------------------------------------+  |
-+-------------------------------------------------------------------+
+ Grille GPU : 48 Blocs de 32 Threads = 1536 Threads actifs simultanés
+ +---------------------------------------------------------------------------------------+
+ | Thread ID (i) : [ 0 ]   [ 1 ]   [ 2 ]  |  [ 3 ]   [ 4 ]   [ 5 ]  | ... | [ 1535 ]     |
+ | Particule     : P0      P0      P0     |  P1      P1      P1     | ... | P511         |
+ | Dimension     : Dim 0   Dim 1   Dim 2  |  Dim 0   Dim 1   Dim 2  | ... | Dim 2        |
+ +---------------------------------------------------------------------------------------+
+                                           |
+                +--------------------------+--------------------------+
+                |                                                     |
+                v (Kernel 1 : Parallélisme Total)                     v (Kernel 2 : Filtrage)
+      Calcul simultané des vitesses                          Seuls les threads où i % D == 0
+       et positions pour chaque                              évaluent la fonction fitness
+       composante scalaire (SIMT)                            pour la particule correspondante
 ```
 
-#### Principes d'Optimisation Mémoire :
-1. **Coalescence des accès à la mémoire globale** : Tous les threads d'un *half-warp* (16 threads) ou warp (32 threads) doivent accéder à des éléments mémoire contigus (segments de 32, 64 ou 128 octets). Des accès non alignés engendrent plusieurs transactions mémoire distinctes.
-2. **Utilisation de la Mémoire Partagée (`__shared__`)** : Très rapide (équivalente aux registres). Permet d'éviter d'aller chercher les mêmes données plusieurs fois en mémoire globale.
-3. **Mémoire Constante (`__constant__`)** : Mise en cache dédiée. Idéale pour les paramètres algorithmiques constants lus simultanément par tous les threads.
-
 ---
 
-### 2.5 Modèle de Compilation NVCC et API CUDA
-Le compilateur `nvcc` sépare le code source :
-* Code **Host** (exécuté sur le CPU) $\rightarrow$ Compilé par GCC/MSVC.
-* Code **Device** (*kernels* `__global__` et fonctions `__device__`) $\rightarrow$ Compilé en code intermédiaire **PTX** puis en binaire machine GPU (**SASS**).
-
-#### Cycle de vie synchrone standard :
-1. `cudaMalloc` : Allocation de la mémoire GPU (Device).
-2. `cudaMemcpy(HostToDevice)` : Copie des données initiales de la RAM vers le GPU.
-3. Launch Kernel : `kernel<<<grid, block>>>(params)` (Non-bloquant pour le CPU).
-4. `cudaMemcpy(DeviceToHost)` : Transfert synchrone des résultats du GPU vers la RAM.
-5. `cudaFree` : Libération de la mémoire GPU.
-
----
-
-## 3. Analyse Détaillée de l'Architecture du Code Source `cudapso`
-
-Le projet est constitué de 5 fichiers principaux :
-* [kernel.h](file:///c:/Users/youne/Downloads/cudapso/kernel.h) : Constantes et prototypes.
-* [main.cpp](file:///c:/Users/youne/Downloads/cudapso/main.cpp) : Point d'entrée Host (CPU).
-* [kernel.cpp](file:///c:/Users/youne/Downloads/cudapso/kernel.cpp) : Évaluations de fitness et fonctions utilitaires sur Host.
-* [kernel.cu](file:///c:/Users/youne/Downloads/cudapso/kernel.cu) : Kernels CUDA et wrapper GPU.
-* [CudaPSO.ipynb](file:///c:/Users/youne/Downloads/cudapso/CudaPSO.ipynb) : Notebook Jupyter pour exécution Google Colab (GPU T4, CUDA 10.0).
-
----
-
-### 3.1 Définition des Fonctions Benchmark (Problèmes d'Optimisation)
-
-Le projet intègre 5 fonctions objectifs d'optimisation numérique (*Shifted & Benchmark Functions*), sélectionnées via la constante `SELECTED_OBJ_FUNC` :
-
-1. **Fonction 0 : Levy 3D** ($F_0$)
-   $$y_i = 1 + \frac{x_i - 1}{4}$$
-   $$f(x) = \sin^2(\pi y_1) + \sum_{i=1}^{D-1} (y_i - 1)^2 [1 + 10 \sin^2(\pi y_{i+1})] + (y_D - 1)^2$$
-2. **Fonction 1 : Shifted Rastrigin** ($F_1$)
-   $$f(x) = \sum_{i=1}^{D} [z_i^2 - 10 \cos(2\pi z_i) + 10] - 330, \quad z = x - o$$
-3. **Fonction 2 : Shifted Rosenbrock** ($F_2$)
-   $$f(x) = \sum_{i=1}^{D-1} [100(z_i^2 - z_{i+1})^2 + (z_i - 1)^2] + 390$$
-4. **Fonction 3 : Shifted Griewank** ($F_3$)
-   $$f(x) = \sum_{i=1}^{D} \frac{z_i^2}{4000} - \prod_{i=1}^{D} \cos\left(\frac{z_i}{\sqrt{i}}\right) + 1 - 180$$
-5. **Fonction 4 : Shifted Sphere** ($F_4$)
-   $$f(x) = \sum_{i=1}^{D} z_i^2 - 450$$
-
----
-
-### 3.2 Modélisation Algorithmique du Particle Swarm Optimization (PSO)
-
-Dans l'implémentation PSO du projet :
-* **Nombre de particules ($N$)** : `NUM_OF_PARTICLES = 512`
-* **Nombre de dimensions ($D$)** : `NUM_OF_DIMENSIONS = 3`
-* **Taille totale des tableaux** : $N \times D = 512 \times 3 = 1536$ éléments.
-* **Paramètres PSO** : $\omega = 0.5$ (inertie), $c_1 = 1.5$ (coefficient cognitif), $c_2 = 1.5$ (coefficient social).
-
-#### Équations de mise à jour des particules :
-1. **Mise à jour des vitesses** :
-   $$v_{i,d}^{t+1} = \omega \cdot v_{i,d}^t + c_1 \cdot r_1 \cdot (pBest_{i,d} - x_{i,d}^t) + c_2 \cdot r_2 \cdot (gBest_d - x_{i,d}^t)$$
-2. **Mise à jour des positions** :
-   $$x_{i,d}^{t+1} = x_{i,d}^t + v_{i,d}^{t+1}$$
-
----
-
-### 3.3 Organisation des Threads et Kernels GPU
-
-Dans [kernel.cu](file:///c:/Users/youne/Downloads/cudapso/kernel.cu) :
-* Configuration d'exécution :
-  * `threadsNum = 32` (Taille d'un bloc = 1 warp).
-  * `blocksNum = ceil(1536 / 32) = 48` blocs.
-  * Nombre total de threads lancés = $48 \times 32 = 1536$ threads (1 thread par composante scalaire particule-dimension).
+### 3.4 Description Détaillée des Kernels et Fonctions Objectifs
 
 #### 1. Kernel `kernelUpdateParticle`
-Chaque thread $i \in [0, N \cdot D - 1]$ traite une unique dimension d'une particule :
-* Identifie la particule correspondante et l'indice de dimension via `i % NUM_OF_DIMENSIONS`.
-* Met à jour la vitesse `velocities[i]` et la position `positions[i]`.
+* Déclenché avec une grille de `blocksNum = 48` et `threadsNum = 32` ($48 \times 32 = 1536$ threads).
+* Chaque thread traite directement la composante $i$ en accédant aux tableaux contigus en mémoire globale.
+* Accède à $gBest[i \pmod D]$ pour appliquer la composante sociale.
 
 #### 2. Kernel `kernelUpdatePBest`
-Destiné à mettre à jour les meilleures positions personnelles ($pBest$) :
-* Seuls les threads avec `i % NUM_OF_DIMENSIONS == 0` (soit le premier thread de chaque particule) effectuent l'évaluation.
-* Copie la position courante et le $pBest$ courant de la particule dans deux tableaux temporaires `tempParticle1` et `tempParticle2`.
-* Calcule $f(\text{tempParticle1})$ et $f(\text{tempParticle2})$. Si la position courante est meilleure, la position $pBest$ de la particule est mise à jour.
+* Effectue l'évaluation de fitness sur le GPU via `fitness_function(x)`.
+* Seuls les threads dont l'indice vérifie `i % NUM_OF_DIMENSIONS == 0` (soit le premier thread de chaque particule) réalisent l'évaluation et la comparaison avec l'ancien $pBest$.
 
-#### 3. Boucle Principale Host-Device (`cuda_pso`)
-Pour chaque itération `iter` de $0$ à `MAX_ITER - 1` :
-1. Lancement de `kernelUpdateParticle<<<48, 32>>>`.
-2. Lancement de `kernelUpdatePBest<<<48, 32>>>`.
-3. **Copie Device-to-Host** : Transfert de `pBests` du GPU vers la RAM du CPU.
-4. **Calcul de `gBest` sur CPU** : Parcours séquentiel des $pBest$ sur le CPU avec `host_fitness_function`.
-5. **Copie Host-to-Device** : Transfert de la nouvelle valeur de `gBest` vers la mémoire du GPU.
+#### 3. Fonctions Benchmark Intégrées
+Le code implémente 5 fonctions objectifs d'optimisation numérique (définies dans `kernel.cu` et `kernel.cpp`), sélectionnées via `SELECTED_OBJ_FUNC` :
+1. **Levy 3D** ($F_0$) : Multimodale complexe, minimum théorique $f(x^*) = 0$.
+2. **Shifted Rastrigin** ($F_1$) : Hautement multimodale, nombreuses trappes locales, décalée de $-330$.
+3. **Shifted Rosenbrock** ($F_2$) : Vallée étroite non-séparable, décalée de $+390$.
+4. **Shifted Griewank** ($F_3$) : Nombreux minima locaux réguliers avec terme produit, décalée de $-180$.
+5. **Shifted Sphere** ($F_4$) : Fonction unimodale convexe servant de référence de convergence, décalée de $-450$.
 
 ---
 
@@ -190,7 +188,7 @@ Bien que le code fonctionne de manière basique, une analyse approfondie révèl
 ```
 
 ### 4.1 Vulnérabilité Majeure 1 : Condition de Course (Data Race Hazard)
-Dans [kernel.cu](file:///c:/Users/youne/Downloads/cudapso/kernel.cu#L8-L9) :
+Dans [kernel.cu](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/kernel.cu#L8-L9) :
 ```cuda
 __device__ float tempParticle1[NUM_OF_DIMENSIONS];
 __device__ float tempParticle2[NUM_OF_DIMENSIONS];
@@ -308,11 +306,11 @@ Pour valider les performances théoriques et pratiques de l'implémentation :
 
 | Composant | Emplacement du Fichier | Description |
 | :--- | :--- | :--- |
-| **En-tête GPU** | [kernel.h](file:///c:/Users/youne/Downloads/cudapso/kernel.h) | Déclaration des constantes, prototypes et paramètres PSO |
-| **Source CPU** | [main.cpp](file:///c:/Users/youne/Downloads/cudapso/main.cpp) | Initialisation, boucle d'exécution CPU et timing |
-| **Fitness Host** | [kernel.cpp](file:///c:/Users/youne/Downloads/cudapso/kernel.cpp) | Évaluation des 5 fonctions benchmark sur CPU |
-| **Kernels CUDA** | [kernel.cu](file:///c:/Users/youne/Downloads/cudapso/kernel.cu) | Kernels de mise à jour des positions, $pBest$ et wrapper Host-Device |
-| **Notebook Jupyter**| [CudaPSO.ipynb](file:///c:/Users/youne/Downloads/cudapso/CudaPSO.ipynb) | Environnement de compilation et d'exécution Colab |
-| **Cours CUDA** | [courscuda.pdf](file:///c:/Users/youne/Downloads/cudapso/courscuda.pdf) | Support de cours théorique CUDA |
-| **Sujet Master** | [MasterworkcudaPSODE.pdf](file:///c:/Users/youne/Downloads/cudapso/MasterworkcudaPSODE.pdf) | Cahier des charges du projet de Master |
-| **Papier Référence**| [An_Improved_CUDA-Based-Implementation...pdf](file:///c:/Users/youne/Downloads/cudapso/An_Improved_CUDA-Based-Implementation_of_Different.pdf) | Article de recherche de référence pour l'optimisation DE sur GPU |
+| **En-tête GPU** | [kernel.h](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/kernel.h) | Déclaration des constantes, prototypes et paramètres PSO |
+| **Source CPU** | [main.cpp](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/main.cpp) | Initialisation, boucle d'exécution CPU et timing |
+| **Fitness Host** | [kernel.cpp](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/kernel.cpp) | Évaluation des 5 fonctions benchmark sur CPU |
+| **Kernels CUDA** | [kernel.cu](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/kernel.cu) | Kernels de mise à jour des positions, $pBest$ et wrapper Host-Device |
+| **Notebook Jupyter**| [CudaPSO.ipynb](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/CudaPSO.ipynb) | Environnement de compilation et d'exécution Colab |
+| **Implémentation CUDA DE** | `cudaDE_I/` | Implémentation CUDA de Differential Evolution |
+| **Sujet Master** | [MasterworkcudaPSODE.pdf](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/MasterworkcudaPSODE.pdf) | Cahier des charges du projet de Master |
+| **Papier Référence**| [An_Improved_CUDA-Based-Implementation...pdf](file:///c:/Users/youne/Documents/Projetcmp/ProjetCmp/An_Improved_CUDA-Based-Implementation_of_Different.pdf) | Article de recherche de référence pour l'optimisation DE sur GPU |
